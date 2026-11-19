@@ -6,8 +6,9 @@ using UnityEngine.Events;
 /// <summary>
 /// Enemigo ciego que solo percibe por sonido.
 ///  - Oido realista: atenuacion por distancia y por paredes, y error de localizacion.
-///  - Patrones: (1) prediccion de movimiento por cadencia de pasos, (2) zonas calientes
-///    donde el jugador hace ruido, (3) aprendizaje de señuelos (objetos lanzados).
+///  - Patrones: (1) prediccion de movimiento por regresion ponderada de pasos,
+///    (2) zonas calientes donde el jugador hace ruido (con enfriamiento al visitarlas en vano),
+///    (3) aprendizaje de señuelos (objetos lanzados).
 ///  - Estados: Patrol, Investigate, Hunt, Search, Attack.
 /// Requiere NavMesh (paquete AI Navigation) y un NavMeshAgent.
 /// </summary>
@@ -22,7 +23,7 @@ public class BlindEnemyAI : MonoBehaviour
     [Header("Cautela (estilo A Quiet Place)")]
     public Vector2 moveBurst = new Vector2(1.5f, 3f);   // seg. avanzando
     public Vector2 pauseTime = new Vector2(1f, 2.5f);   // seg. quieto escuchando
-    public float huntFreshSound = 1.5f;                 // si no oye nada en este tiempo, baja el ritmo
+    public float huntFreshSound = 1.5f;                 // sin oir nada en este tiempo, en Hunt baja el ritmo
     float creepTimer;
     bool creepPaused;
 
@@ -62,14 +63,19 @@ public class BlindEnemyAI : MonoBehaviour
     public float hotspotCellSize = 6f;
     public float hotspotHalfLife = 120f;
     [Range(0f, 1f)] public float patrolHotspotBias = 0.5f;
+    [Range(0f, 1f)] public float hotspotCooling = 0.6f;   // multiplicador de calor al visitar una zona sin hallar nada
     public float predictionLead = 0.8f;
     public float maxPredictDistance = 8f;
+    public float maxPlayerSpeed = 6f;                     // tope de velocidad estimada del jugador
     public float decoyConfirmRadius = 3.5f;
     public float credibilityLoss = 0.3f;
     public float credibilityGain = 0.15f;
     public float credibilityRecoveryPerSec = 0.01f;
     public float searchRadius = 8f;
     public float searchWait = 1.5f;
+
+    [Header("Navegacion")]
+    public float stuckTime = 2.5f;                        // seg. atascado antes de replanificar
 
     NavMeshAgent agent;
     State state;
@@ -79,6 +85,8 @@ public class BlindEnemyAI : MonoBehaviour
     readonly List<Heard> steps = new();
     readonly Dictionary<Vector2Int, Hotspot> hotspots = new();
     readonly List<Vector2Int> removeBuffer = new();
+    readonly List<Hotspot> hotBuffer = new();
+    readonly List<Vector3> candidateBuffer = new();
     float[] credibility;
 
     // estado de percepcion
@@ -86,12 +94,16 @@ public class BlindEnemyAI : MonoBehaviour
     Vector3 lastHeardPos;
     float lastHeardTime;
     Vector3 predictedVelocity;
+    Vector3 predictionAnchor;
+    float predictionAnchorTime;
     float predictionConfidence;
 
     // estado de comportamiento
     Vector3 investigatePos;
     SoundType investigateType;
-    float listenTimer, nextListenAllowed, attackTimer, waitTimer, repathTimer;
+    float investigateIntensity;
+    Hotspot patrolHotspot;
+    float listenTimer, nextListenAllowed, attackTimer, waitTimer, repathTimer, stuckTimer;
     bool hasTarget;
     readonly Queue<Vector3> searchQueue = new();
     readonly RaycastHit[] hitBuffer = new RaycastHit[8];
@@ -142,7 +154,9 @@ public class BlindEnemyAI : MonoBehaviour
         }
         else if (alert >= investigateThreshold && state != State.Hunt)
         {
-            BeginInvestigate(heardPos, e.type);
+            // Evita cambiar de objetivo con cada sonido debil mientras ya investiga uno mas fuerte
+            if (state != State.Investigate || intensity >= investigateIntensity * 0.7f)
+                BeginInvestigate(heardPos, e.type, intensity);
         }
 
         if (wasCalm && listenTimer <= 0f && Time.time >= nextListenAllowed)
@@ -178,56 +192,136 @@ public class BlindEnemyAI : MonoBehaviour
         lastHeardTime = Time.time;
         alert = Mathf.Clamp01(alert + intensity * alertGain);
 
-        // PATRON 2: zonas calientes
+        // PATRON 2: zonas calientes (los señuelos y ruidos ambiguos calientan menos)
+        float heatGain = IsHuntable(type) ? intensity : intensity * 0.4f;
         var cell = new Vector2Int(Mathf.RoundToInt(pos.x / hotspotCellSize), Mathf.RoundToInt(pos.z / hotspotCellSize));
         if (!hotspots.TryGetValue(cell, out var hs)) { hs = new Hotspot { center = pos }; hotspots[cell] = hs; }
-        hs.center = Vector3.Lerp(hs.center, pos, intensity / (hs.heat + intensity));
-        hs.heat += intensity;
+        hs.center = Vector3.Lerp(hs.center, pos, heatGain / (hs.heat + heatGain));
+        hs.heat += heatGain;
 
         // PATRON 1: cadencia de pasos
         if (IsPlayerLike(type))
         {
             steps.Add(h);
             while (steps.Count > 0 && steps[0].time < Time.time - 4f) steps.RemoveAt(0);
-            if (steps.Count > 6) steps.RemoveAt(0);
+            if (steps.Count > 8) steps.RemoveAt(0);
             UpdatePrediction();
         }
     }
 
+    /// <summary>Conocimiento exacto (contacto fisico): corrige la memoria con una muestra fiable.</summary>
+    void SetExactKnowledge(Vector3 pos)
+    {
+        lastHeardPos = pos;
+        lastHeardTime = Time.time;
+        memory.Add(new Heard { pos = pos, time = Time.time, intensity = 1f, type = SoundType.Footstep });
+        if (memory.Count > 24) memory.RemoveAt(0);
+    }
+
     // ------------------------------------------------------------- PATRONES
+    /// <summary>
+    /// Regresion lineal ponderada (por intensidad) de las posiciones oidas en el tiempo.
+    /// Filtra el ruido de localizacion mucho mejor que usar solo primer y ultimo paso.
+    /// </summary>
     void UpdatePrediction()
     {
         predictionConfidence = 0f;
-        if (steps.Count < 3) return;
+        int n = steps.Count;
+        if (n < 3) return;
 
-        Heard a = steps[0], b = steps[steps.Count - 1];
-        float dt = b.time - a.time;
-        if (dt < 0.3f) return;
+        float span = steps[n - 1].time - steps[0].time;
+        if (span < 0.3f) return;
 
-        Vector3 v = (b.pos - a.pos) / dt;
+        float t0 = steps[0].time;
+        float wSum = 0f, tm = 0f;
+        Vector3 pm = Vector3.zero;
+        for (int i = 0; i < n; i++)
+        {
+            float w = steps[i].intensity + 0.05f;
+            wSum += w;
+            tm += w * (steps[i].time - t0);
+            pm += w * steps[i].pos;
+        }
+        tm /= wSum;
+        pm /= wSum;
+
+        float stt = 0f;
+        Vector3 stp = Vector3.zero;
+        for (int i = 0; i < n; i++)
+        {
+            float w = steps[i].intensity + 0.05f;
+            float dtv = (steps[i].time - t0) - tm;
+            stt += w * dtv * dtv;
+            stp += w * dtv * (steps[i].pos - pm);
+        }
+        if (stt < 0.05f) return;
+
+        Vector3 v = stp / stt;
         v.y = 0f;
+        if (v.magnitude > maxPlayerSpeed) v = v.normalized * maxPlayerSpeed;
         predictedVelocity = v;
 
+        // ancla suavizada: posicion estimada en el instante del ultimo paso
+        float tLast = steps[n - 1].time - t0;
+        predictionAnchor = pm + v * (tLast - tm);
+        predictionAnchor.y = steps[n - 1].pos.y;
+        predictionAnchorTime = steps[n - 1].time;
+
+        // error residual del ajuste
+        float res = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float w = steps[i].intensity + 0.05f;
+            Vector3 expected = pm + v * ((steps[i].time - t0) - tm);
+            Vector3 diff = steps[i].pos - expected;
+            diff.y = 0f;
+            res += w * diff.sqrMagnitude;
+        }
+        res = Mathf.Sqrt(res / wSum);
+        float fit = Mathf.Sqrt(Mathf.Clamp01(1f - res / Mathf.Max(maxLocalizationError, 0.1f)));
+
         // regularidad del ritmo: coeficiente de variacion de los intervalos
-        float mean = dt / (steps.Count - 1), var = 0f;
-        for (int i = 1; i < steps.Count; i++)
+        float mean = span / (n - 1), var = 0f;
+        for (int i = 1; i < n; i++)
         {
             float d = (steps[i].time - steps[i - 1].time) - mean;
             var += d * d;
         }
-        float cv = Mathf.Sqrt(var / (steps.Count - 1)) / Mathf.Max(mean, 0.01f);
-        predictionConfidence = Mathf.Clamp01(1f - cv) * Mathf.Clamp01(v.magnitude / 1.2f);
+        float cv = Mathf.Sqrt(var / (n - 1)) / Mathf.Max(mean, 0.01f);
+
+        predictionConfidence = Mathf.Clamp01(1f - cv) * Mathf.Clamp01(v.magnitude / 1.2f) * fit;
     }
+
+    bool HasPrediction(float minConfidence, float maxAge) =>
+        steps.Count > 0 && predictionConfidence >= minConfidence && Time.time - predictionAnchorTime < maxAge;
+
+    bool CanPredict => HasPrediction(0.35f, 2f);
 
     Vector3 PredictedPosition()
     {
-        Heard last = steps[steps.Count - 1];
-        float elapsed = Time.time - last.time + predictionLead;
+        float elapsed = Time.time - predictionAnchorTime + predictionLead;
         Vector3 offset = predictedVelocity.normalized * Mathf.Min(predictedVelocity.magnitude * elapsed, maxPredictDistance);
-        return last.pos + offset;
+        return predictionAnchor + offset;
     }
 
-    bool CanPredict => predictionConfidence >= 0.35f && steps.Count > 0 && Time.time - steps[steps.Count - 1].time < 2f;
+    /// <summary>Promedia los sonidos recientes (ponderados) para reducir el error de localizacion.</summary>
+    Vector3 EstimateHeardTarget()
+    {
+        const float window = 2.5f;
+        float wSum = 0f;
+        Vector3 acc = Vector3.zero;
+        for (int i = memory.Count - 1; i >= 0; i--)
+        {
+            Heard h = memory[i];
+            float age = Time.time - h.time;
+            if (age > window) break;
+            if (!IsHuntable(h.type)) continue;
+            float w = h.intensity * (1f - age / window);
+            acc += h.pos * w;
+            wSum += w;
+        }
+        return wSum > 0.001f ? acc / wSum : lastHeardPos;
+    }
 
     void DecayHeat(float dt)
     {
@@ -242,14 +336,28 @@ public class BlindEnemyAI : MonoBehaviour
         foreach (var k in removeBuffer) hotspots.Remove(k);
     }
 
+    // Devuelve una lista reutilizada: usarla antes de volver a llamar.
     List<Hotspot> TopHotspots(int count, Vector3 near, float maxDist)
     {
-        var list = new List<Hotspot>();
+        hotBuffer.Clear();
         foreach (var kv in hotspots)
-            if (kv.Value.heat > 0.8f && Vector3.Distance(kv.Value.center, near) <= maxDist) list.Add(kv.Value);
-        list.Sort((x, y) => y.heat.CompareTo(x.heat));
-        if (list.Count > count) list.RemoveRange(count, list.Count - count);
-        return list;
+            if (kv.Value.heat > 0.8f && Vector3.Distance(kv.Value.center, near) <= maxDist) hotBuffer.Add(kv.Value);
+        hotBuffer.Sort((x, y) => y.heat.CompareTo(x.heat));
+        if (hotBuffer.Count > count) hotBuffer.RemoveRange(count, hotBuffer.Count - count);
+        return hotBuffer;
+    }
+
+    static Hotspot PickWeighted(List<Hotspot> list)
+    {
+        float total = 0f;
+        foreach (var h in list) total += h.heat;
+        float r = Random.value * total;
+        foreach (var h in list)
+        {
+            r -= h.heat;
+            if (r <= 0f) return h;
+        }
+        return list[list.Count - 1];
     }
 
     // --------------------------------------------------------- COMPORTAMIENTO
@@ -257,6 +365,7 @@ public class BlindEnemyAI : MonoBehaviour
     {
         float dt = Time.deltaTime;
         alert = Mathf.Max(0f, alert - alertDecay * dt);
+        investigateIntensity = Mathf.Max(0f, investigateIntensity - 0.1f * dt);
         DecayHeat(dt);
         for (int i = 0; i < credibility.Length; i++)
             credibility[i] = Mathf.Min(1f, credibility[i] + credibilityRecoveryPerSec * dt);
@@ -265,21 +374,17 @@ public class BlindEnemyAI : MonoBehaviour
         if (state == State.Attack)
         {
             attackTimer -= dt;
+            if (player) FaceTowards(player.position, dt);
             if (attackTimer <= 0f)
             {
                 agent.isStopped = false;
-                if (player) { lastHeardPos = player.position; lastHeardTime = Time.time; }
+                if (player) SetExactKnowledge(player.position);
                 SetState(State.Hunt);
             }
             return;
         }
 
-        if (player && Vector3.Distance(transform.position, player.position) <= attackRange)
-        {
-            SetState(State.Attack);
-            return;
-        }
-        if (player && Vector3.Distance(transform.position, player.position) <= attackRange)
+        if (player && (player.position - transform.position).sqrMagnitude <= attackRange * attackRange)
         {
             SetState(State.Attack);
             return;
@@ -301,6 +406,8 @@ public class BlindEnemyAI : MonoBehaviour
             if (creepPaused) { FaceTowards(lastHeardPos, dt); return; }
         }
 
+        if (TickStuck(dt)) return;
+
         switch (state)
         {
             case State.Patrol: TickPatrol(dt); break;
@@ -315,6 +422,8 @@ public class BlindEnemyAI : MonoBehaviour
         state = s;
         hasTarget = false;
         waitTimer = 0f;
+        stuckTimer = 0f;
+        patrolHotspot = null;
         agent.isStopped = false;
         switch (s)
         {
@@ -331,6 +440,34 @@ public class BlindEnemyAI : MonoBehaviour
         }
     }
 
+    /// <summary>Detecta atascos (puerta cerrada, ruta bloqueada) y replanifica. Devuelve true si intervino.</summary>
+    bool TickStuck(float dt)
+    {
+        bool moving = !agent.isStopped && !agent.pathPending && agent.hasPath && !HasArrived();
+        if (!moving || agent.velocity.sqrMagnitude > 0.04f) { stuckTimer = 0f; return false; }
+
+        stuckTimer += dt;
+        if (stuckTimer < stuckTime) return false;
+        stuckTimer = 0f;
+
+        switch (state)
+        {
+            case State.Patrol:
+            case State.Search:
+                hasTarget = false;
+                waitTimer = 0f;
+                break;
+            case State.Investigate:
+                BuildSearchQueue(1);
+                SetState(State.Search);
+                return true;
+            case State.Hunt:
+                repathTimer = 0f;
+                break;
+        }
+        return false;
+    }
+
     void TickPatrol(float dt)
     {
         if (waitTimer > 0f) { waitTimer -= dt; return; }
@@ -339,26 +476,38 @@ public class BlindEnemyAI : MonoBehaviour
             hasTarget = SetDest(PickPatrolTarget());
             return;
         }
-        if (HasArrived()) { hasTarget = false; waitTimer = Random.Range(1f, 2.5f); }
+        if (HasArrived())
+        {
+            // Llego a una zona caliente y no hay nadie: pierde interes en ella
+            if (patrolHotspot != null) { patrolHotspot.heat *= hotspotCooling; patrolHotspot = null; }
+            hasTarget = false;
+            waitTimer = Random.Range(1f, 2.5f);
+        }
     }
 
     Vector3 PickPatrolTarget()
     {
-        // PATRON 2: a veces patrulla donde el jugador hizo mas ruido
+        patrolHotspot = null;
+        // PATRON 2: a veces patrulla donde el jugador hizo mas ruido (eleccion ponderada por calor)
         if (Random.value < patrolHotspotBias)
         {
             var top = TopHotspots(3, transform.position, 60f);
-            if (top.Count > 0) return top[Random.Range(0, top.Count)].center;
+            if (top.Count > 0)
+            {
+                patrolHotspot = PickWeighted(top);
+                return patrolHotspot.center;
+            }
         }
         if (patrolPoints != null && patrolPoints.Length > 0)
             return patrolPoints[Random.Range(0, patrolPoints.Length)].position;
         return transform.position + Random.insideUnitSphere * 15f;
     }
 
-    void BeginInvestigate(Vector3 pos, SoundType type)
+    void BeginInvestigate(Vector3 pos, SoundType type, float intensity)
     {
         investigatePos = pos;
         investigateType = type;
+        investigateIntensity = intensity;
         if (state != State.Investigate) SetState(State.Investigate);
         hasTarget = SetDest(pos);
     }
@@ -381,7 +530,7 @@ public class BlindEnemyAI : MonoBehaviour
 
         if (playerNear)
         {
-            if (player) { lastHeardPos = player.position; lastHeardTime = Time.time; }
+            SetExactKnowledge(player.position);
             alert = 1f;
             SetState(State.Hunt);
         }
@@ -394,27 +543,68 @@ public class BlindEnemyAI : MonoBehaviour
 
     void TickHunt(float dt)
     {
-        if (Time.time - lastHeardTime > huntMemory)
+        float fresh = Time.time - lastHeardTime;
+        if (fresh > huntMemory)
         {
             BuildSearchQueue(3);
             SetState(State.Search);
             return;
         }
+
+        // Si hace rato que no oye nada, avanza con mas cautela (usa huntFreshSound)
+        float k = Mathf.InverseLerp(huntFreshSound, huntMemory, fresh);
+        agent.speed = Mathf.Lerp(huntSpeed, investigateSpeed, k);
+
+        // Llego a donde creia que estaba el jugador y no oye nada nuevo: busca alrededor
+        if (hasTarget && HasArrived() && fresh > huntFreshSound)
+        {
+            BuildSearchQueue(3);
+            SetState(State.Search);
+            return;
+        }
+
         repathTimer -= dt;
         if (repathTimer > 0f) return;
         repathTimer = 0.25f;
-        SetDest(CanPredict ? PredictedPosition() : lastHeardPos);
+        hasTarget = SetDest(CanPredict ? PredictedPosition() : EstimateHeardTarget());
     }
 
     void BuildSearchQueue(int hotspotCount)
     {
         searchQueue.Clear();
-        if (steps.Count > 0 && predictionConfidence > 0.2f) searchQueue.Enqueue(PredictedPosition());
-        foreach (var h in TopHotspots(hotspotCount, lastHeardPos, 30f)) searchQueue.Enqueue(h.center);
-        for (int i = 0; i < 2; i++)
+        candidateBuffer.Clear();
+
+        Vector3 cur = transform.position;
+        if (HasPrediction(0.2f, 8f))
         {
-            Vector2 c = Random.insideUnitCircle * searchRadius;
-            searchQueue.Enqueue(lastHeardPos + new Vector3(c.x, 0f, c.y));
+            cur = PredictedPosition();
+            searchQueue.Enqueue(cur);   // lo mas probable, siempre primero
+        }
+
+        foreach (var h in TopHotspots(hotspotCount, lastHeardPos, 30f)) candidateBuffer.Add(h.center);
+
+        for (int i = 0; i < 3; i++)
+        {
+            float ang = Random.value * Mathf.PI * 2f;
+            float r = Random.Range(0.3f, 1f) * searchRadius;
+            Vector3 p = lastHeardPos + new Vector3(Mathf.Cos(ang) * r, 0f, Mathf.Sin(ang) * r);
+            if (NavMesh.SamplePosition(p, out var hit, 4f, NavMesh.AllAreas)) p = hit.position;
+            candidateBuffer.Add(p);
+        }
+
+        // Orden por vecino mas cercano para no hacer zigzag
+        while (candidateBuffer.Count > 0)
+        {
+            int best = 0;
+            float bestD = float.MaxValue;
+            for (int i = 0; i < candidateBuffer.Count; i++)
+            {
+                float d = (candidateBuffer[i] - cur).sqrMagnitude;
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            cur = candidateBuffer[best];
+            searchQueue.Enqueue(cur);
+            candidateBuffer.RemoveAt(best);
         }
     }
 
@@ -437,7 +627,12 @@ public class BlindEnemyAI : MonoBehaviour
         return agent.SetDestination(hit.position);
     }
 
-    bool HasArrived() => !agent.pathPending && agent.remainingDistance <= agent.stoppingDistance + 0.3f;
+    bool HasArrived()
+    {
+        if (agent.pathPending) return false;
+        if (agent.pathStatus == NavMeshPathStatus.PathInvalid) return true;
+        return agent.remainingDistance <= agent.stoppingDistance + 0.3f;
+    }
 
     void FaceTowards(Vector3 worldPos, float dt)
     {
@@ -445,6 +640,15 @@ public class BlindEnemyAI : MonoBehaviour
         d.y = 0f;
         if (d.sqrMagnitude < 0.01f) return;
         transform.rotation = Quaternion.Slerp(transform.rotation, Quaternion.LookRotation(d), 6f * dt);
+    }
+
+    void TickCreep(float dt)
+    {
+        creepTimer -= dt;
+        if (creepTimer > 0f) return;
+        creepPaused = !creepPaused;
+        creepTimer = Random.Range(creepPaused ? pauseTime.x : moveBurst.x,
+                                  creepPaused ? pauseTime.y : moveBurst.y);
     }
 
     void OnDrawGizmosSelected()
@@ -455,18 +659,10 @@ public class BlindEnemyAI : MonoBehaviour
         Gizmos.color = new Color(1f, 0.3f, 0.1f, 0.6f);
         foreach (var kv in hotspots) Gizmos.DrawWireSphere(kv.Value.center, Mathf.Clamp(kv.Value.heat * 0.4f, 0.5f, 4f));
 
-        if (Application.isPlaying && steps.Count > 0 && predictionConfidence > 0.2f)
+        if (Application.isPlaying && HasPrediction(0.2f, 8f))
         {
             Gizmos.color = Color.cyan;
             Gizmos.DrawSphere(PredictedPosition(), 0.4f);
         }
-    }
-    void TickCreep(float dt)
-    {
-        creepTimer -= dt;
-        if (creepTimer > 0f) return;
-        creepPaused = !creepPaused;
-        creepTimer = Random.Range(creepPaused ? pauseTime.x : moveBurst.x,
-                                  creepPaused ? pauseTime.y : moveBurst.y);
     }
 }
