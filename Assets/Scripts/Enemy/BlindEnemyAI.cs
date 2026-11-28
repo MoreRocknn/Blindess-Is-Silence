@@ -15,9 +15,10 @@ using UnityEngine.Events;
 [RequireComponent(typeof(NavMeshAgent))]
 public class BlindEnemyAI : MonoBehaviour
 {
-    enum State { Patrol, Investigate, Hunt, Search, Attack }
+    public enum State { Patrol, Investigate, Hunt, Search, Attack }
 
-    class Heard { public Vector3 pos; public float time; public float intensity; public SoundType type; }
+    // struct: no genera basura (GC) por cada sonido que oye
+    struct Heard { public Vector3 pos; public float time; public float intensity; public SoundType type; }
     class Hotspot { public float heat; public Vector3 center; }
 
     [Header("Cautela (estilo A Quiet Place)")]
@@ -27,9 +28,12 @@ public class BlindEnemyAI : MonoBehaviour
     float creepTimer;
     bool creepPaused;
 
+
     [Header("Referencias")]
     public Transform ears;
     public Transform player;                 // solo se usa para el contacto/ataque
+    [Tooltip("PasosPersonaje del jugador. Vacio = se busca en 'player'.")]
+    public PasosPersonaje playerNoise;
     public Transform[] patrolPoints;         // opcional; si esta vacio, vaga por el NavMesh
 
     [Header("Oido")]
@@ -38,6 +42,10 @@ public class BlindEnemyAI : MonoBehaviour
     [Range(0f, 0.95f)] public float wallAttenuation = 0.45f;
     public float maxLocalizationError = 4f;
     public float minIntensity = 0.05f;
+    [Tooltip("Oye al jugador directamente segun lo que hace (correr / caminar / agachado). Desmarcalo si ya emites sus pasos por SoundBus.")]
+    public bool hearPlayerDirectly = true;
+    [Tooltip("Metros a los que se oye al jugador corriendo (ruido = 1). Caminar y agachado usan su parte de este valor.")]
+    public float playerHearingRadius = 20f;
 
     [Header("Alerta")]
     public float alertGain = 1.2f;
@@ -58,6 +66,8 @@ public class BlindEnemyAI : MonoBehaviour
     public float attackRange = 1.6f;
     public float attackCooldown = 1.5f;
     public UnityEvent onAttackPlayer;
+    float roarTimer;
+    public bool Roaring => roarTimer > 0f;
 
     [Header("Patrones / aprendizaje")]
     public float hotspotCellSize = 6f;
@@ -107,6 +117,11 @@ public class BlindEnemyAI : MonoBehaviour
     bool hasTarget;
     readonly Queue<Vector3> searchQueue = new();
     readonly RaycastHit[] hitBuffer = new RaycastHit[8];
+    float stepTimer, slowTimer;
+
+    // Lo lee MonstruoAudio
+    public State Current => state;
+    public float Alert => alert;
 
     static bool IsPlayerLike(SoundType t) => t == SoundType.Footstep || t == SoundType.Run;
     static bool IsHuntable(SoundType t) => t == SoundType.Footstep || t == SoundType.Run || t == SoundType.Voice;
@@ -118,6 +133,7 @@ public class BlindEnemyAI : MonoBehaviour
         credibility = new float[System.Enum.GetValues(typeof(SoundType)).Length];
         for (int i = 0; i < credibility.Length; i++) credibility[i] = 1f;
         if (!ears) ears = transform;
+        if (!playerNoise && player) playerNoise = player.GetComponentInChildren<PasosPersonaje>();
     }
 
     void OnEnable() => SoundBus.OnSound += HandleSound;
@@ -126,29 +142,35 @@ public class BlindEnemyAI : MonoBehaviour
     void Start() => SetState(State.Patrol);
 
     // ------------------------------------------------------------------ OIDO
-    void HandleSound(SoundEvent e)
+    void HandleSound(SoundEvent e) => Hear(e.source, e.position, e.loudness, e.type);
+
+    /// <summary>Nucleo del oido: lo usan los eventos de SoundBus y el oido directo al jugador.</summary>
+    void Hear(UnityEngine.Object src, Vector3 position, float loudness, SoundType type)
     {
-        if (e.source == gameObject) return;
+        if (src == gameObject) return;
 
         Vector3 earPos = ears.position;
-        float dist = Vector3.Distance(earPos, e.position);
-        float radius = e.loudness * hearingSensitivity * Occlusion(earPos, e.position);
+        float dist = Vector3.Distance(earPos, position);
+        float radius = loudness * hearingSensitivity;
+        if (dist > radius) return;                       // descarte barato antes de lanzar el raycast
+
+        radius *= Occlusion(earPos, position);
         if (radius <= 0.01f || dist > radius) return;
 
         // Cuanto mas lejos/tapado, menos claro y peor localizado
         float clarity = Mathf.Sqrt(1f - dist / radius);
         Vector2 err = Random.insideUnitCircle * ((1f - clarity) * maxLocalizationError);
-        Vector3 heardPos = e.position + new Vector3(err.x, 0f, err.y);
+        Vector3 heardPos = position + new Vector3(err.x, 0f, err.y);
 
-        float intensity = clarity * credibility[(int)e.type];
+        float intensity = clarity * credibility[(int)type];
         if (intensity < minIntensity) return;
 
-        Register(heardPos, intensity, e.type);
+        Register(heardPos, intensity, type);
         if (state == State.Attack) return;
 
         bool wasCalm = state == State.Patrol || state == State.Search;
 
-        if (alert >= huntThreshold && IsHuntable(e.type))
+        if (alert >= huntThreshold && IsHuntable(type))
         {
             if (state != State.Hunt) SetState(State.Hunt);
         }
@@ -156,7 +178,7 @@ public class BlindEnemyAI : MonoBehaviour
         {
             // Evita cambiar de objetivo con cada sonido debil mientras ya investiga uno mas fuerte
             if (state != State.Investigate || intensity >= investigateIntensity * 0.7f)
-                BeginInvestigate(heardPos, e.type, intensity);
+                BeginInvestigate(heardPos, type, intensity);
         }
 
         if (wasCalm && listenTimer <= 0f && Time.time >= nextListenAllowed)
@@ -360,15 +382,44 @@ public class BlindEnemyAI : MonoBehaviour
         return list[list.Count - 1];
     }
 
+    /// <summary>
+    /// Oye al jugador segun lo que hace: correr se oye lejos, caminar a media distancia
+    /// y agachado casi nada. Usa el mismo 'Ruido' que muestra la barra del medidor.
+    /// </summary>
+    void HearPlayer(float dt)
+    {
+        if (!hearPlayerDirectly || !playerNoise || playerNoise.Ruido <= 0f) { stepTimer = 0f; return; }
+
+        stepTimer -= dt;
+        if (stepTimer > 0f) return;
+
+        bool run = playerNoise.Corriendo;
+        stepTimer = run ? 0.3f : (playerNoise.Agachado ? 0.7f : 0.5f);   // cadencia de pasos
+
+        Hear(playerNoise.gameObject, playerNoise.transform.position,
+             playerNoise.Ruido * playerHearingRadius, run ? SoundType.Run : SoundType.Footstep);
+    }
+
+    /// <summary>Tareas lentas (enfriar zonas, recuperar credibilidad): 1 vez por segundo en vez de cada frame.</summary>
+    void SlowTick(float dt)
+    {
+        slowTimer += dt;
+        if (slowTimer < 1f) return;
+
+        DecayHeat(slowTimer);
+        for (int i = 0; i < credibility.Length; i++)
+            credibility[i] = Mathf.Min(1f, credibility[i] + credibilityRecoveryPerSec * slowTimer);
+        slowTimer = 0f;
+    }
+
     // --------------------------------------------------------- COMPORTAMIENTO
     void Update()
     {
         float dt = Time.deltaTime;
         alert = Mathf.Max(0f, alert - alertDecay * dt);
         investigateIntensity = Mathf.Max(0f, investigateIntensity - 0.1f * dt);
-        DecayHeat(dt);
-        for (int i = 0; i < credibility.Length; i++)
-            credibility[i] = Mathf.Min(1f, credibility[i] + credibilityRecoveryPerSec * dt);
+        SlowTick(dt);
+        HearPlayer(dt);
 
         // Ataque por contacto (es ciego: solo ataca si lo tiene encima)
         if (state == State.Attack)
@@ -387,6 +438,15 @@ public class BlindEnemyAI : MonoBehaviour
         if (player && (player.position - transform.position).sqrMagnitude <= attackRange * attackRange)
         {
             SetState(State.Attack);
+            return;
+        }
+        if (roarTimer > 0f)
+        {
+            roarTimer -= dt;
+            lastHeardTime += dt;              // el rugido no cuenta como "tiempo sin oir nada"
+            agent.isStopped = true;
+            FaceTowards(lastHeardPos, dt);
+            if (roarTimer <= 0f) agent.isStopped = false;
             return;
         }
 
@@ -664,5 +724,11 @@ public class BlindEnemyAI : MonoBehaviour
             Gizmos.color = Color.cyan;
             Gizmos.DrawSphere(PredictedPosition(), 0.4f);
         }
+    }
+    public void Roar(float duration)
+    {
+        roarTimer = duration;
+        agent.isStopped = true;
+        agent.velocity = Vector3.zero;
     }
 }

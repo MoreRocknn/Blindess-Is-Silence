@@ -12,6 +12,12 @@ public class TorchLight : MonoBehaviour
     [SerializeField] private float fadeOutTime = 0.15f; // tiempo de apagado de la luz
     [SerializeField] private float fadeInTime = 0.1f;   // tiempo de encendido de la luz
 
+    [Header("Audio")]
+    [SerializeField] private AudioSource audioSource;
+    [SerializeField] private AudioClip turnOnClip;
+    [SerializeField] private AudioClip turnOffClip;
+    [SerializeField, Range(0f, 1f)] private float volume = 1f;
+
     private bool isOn = true;
     private float maxIntensity;
     private Coroutine fadeRoutine;
@@ -20,6 +26,10 @@ public class TorchLight : MonoBehaviour
     {
         if (torchLight != null)
             maxIntensity = torchLight.intensity;
+
+        // Si no se asigna un AudioSource, intenta cogerlo del mismo objeto
+        if (audioSource == null)
+            audioSource = GetComponent<AudioSource>();
     }
 
     private void OnEnable()
@@ -37,10 +47,18 @@ public class TorchLight : MonoBehaviour
     {
         isOn = !isOn;
 
+        PlaySound(isOn ? turnOnClip : turnOffClip);
+
         if (fadeRoutine != null)
             StopCoroutine(fadeRoutine);
 
         fadeRoutine = StartCoroutine(Fade(isOn));
+    }
+
+    private void PlaySound(AudioClip clip)
+    {
+        if (audioSource != null && clip != null)
+            audioSource.PlayOneShot(clip, volume);
     }
 
     private IEnumerator Fade(bool turnOn)
