@@ -31,10 +31,18 @@ public class Jumpscare : MonoBehaviour
 
     private bool activo;
 
+    // Clic derecho en el titulo del componente (en Play) > "Probar jumpscare"
+    [ContextMenu("Probar jumpscare")]
     public void Iniciar()
     {
         if (activo) return;
         activo = true;
+
+        Debug.Log("[Jumpscare] Iniciado");
+        if (camaraJumpscare == null) Debug.LogWarning("[Jumpscare] Falta asignar 'Camara Jumpscare'.");
+        if (!Application.CanStreamedLevelBeLoaded(escenaGameOver))
+            Debug.LogError("[Jumpscare] La escena '" + escenaGameOver + "' no esta en Build Settings (o el nombre no coincide).");
+
         StartCoroutine(Secuencia());
     }
 
@@ -51,8 +59,19 @@ public class Jumpscare : MonoBehaviour
         BlindEnemyAI ia = GetComponent<BlindEnemyAI>();
         if (ia != null) ia.enabled = false;
 
+        // Deja de leer la velocidad del agente (se va a apagar)
+        MonstruoAnimacion anim = GetComponent<MonstruoAnimacion>();
+        if (anim != null) anim.enabled = false;
+
+        // Quieto del todo: sin ruta, sin inercia y sin que el agente lo empuje
         NavMeshAgent agent = GetComponent<NavMeshAgent>();
-        if (agent != null) { agent.isStopped = true; agent.ResetPath(); }
+        if (agent != null)
+        {
+            agent.isStopped = true;
+            agent.ResetPath();
+            agent.velocity = Vector3.zero;
+            agent.enabled = false;
+        }
 
         // 3) Camara del susto + animacion + sonido
         Camera principal = Camera.main;
@@ -62,7 +81,11 @@ public class Jumpscare : MonoBehaviour
         if (camaraJumpscare != null) camaraJumpscare.SetActive(true);
 
         if (animador == null) animador = GetComponentInChildren<Animator>();
-        if (animador != null) animador.SetTrigger("Jumpscare");
+        if (animador != null)
+        {
+            animador.applyRootMotion = false;   // la animacion no mueve al monstruo
+            animador.SetTrigger("Jumpscare");
+        }
 
         if (sonido != null) AudioSource.PlayClipAtPoint(sonido, oido, volumen);
 
@@ -70,6 +93,10 @@ public class Jumpscare : MonoBehaviour
         yield return new WaitForSeconds(duracion);
 
         UltimaEscena = SceneManager.GetActiveScene().name;
-        SceneManager.LoadScene(escenaGameOver);
+
+        if (Application.CanStreamedLevelBeLoaded(escenaGameOver))
+            SceneManager.LoadScene(escenaGameOver);
+        else
+            Debug.LogError("[Jumpscare] No se puede cargar '" + escenaGameOver + "'. Añadela en Build Settings.");
     }
 }
